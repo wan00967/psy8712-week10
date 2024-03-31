@@ -4,6 +4,8 @@ library(tidyverse)
 library(haven) 
 library(caret)
 library(janitor)
+library(glmnet)
+library(ranger)
 
 # Data Import and Cleaning
 gss_data <- read_spss("../data/GSS2016.sav")
@@ -22,58 +24,47 @@ gss_tbl %>%
 
 # Analysis
 set.seed(123) # For reproducibility
-# Shuffle and split the dataset
-gss_shuffled <- gss_tbl %>% sample_frac()
-split_point <- round(nrow(gss_shuffled) * 0.75)
+# Shuffle and split dataset
+mod_vec = c("lm", "glmnet", "ranger", "xgbTree")
+index = createDataPartition(gss_tbl$`work hours`, p = 0.75, list = FALSE)
+gss_tbl_train = gss_tbl[index,]
+gss_tbl_test = gss_tbl[-index,]
 
-# Creating training and testing sets
-gss_train <- gss_shuffled[1:split_point, ]
-gss_test <- gss_shuffled[(split_point + 1):nrow(gss_shuffled), ]
-
-# Proceed with the rest of the setup
-fold_indices <- createFolds(gss_train_tbl$`work hours`, 
-                            k = 10)
-
-myControl <- trainControl(method = "cv", 
-                          index = fold_indices, 
-                          number = 10, 
-                          verboseIter = TRUE)
-
-# OLS Regression
-model_ols <- train(`work hours` ~ ., 
-                   data = gss_train, 
-                   method = "lm", 
-                   metric = "Rsquared", 
-                   preProcess = "medianImpute", 
-                   na.action = na.pass, 
-                   trControl = myControl)
-ols_predict <- predict(model_ols, gss_test)
-
-# Elastic Net Model
-model_elastic <- train(`work hours` ~ ., 
-                       data = gss_train, 
-                       method = "glmnet", 
-                       preProcess = "medianImpute", 
-                       na.action = na.pass, 
-                       trControl = myControl)
-elastic_predict <- predict(model_elastic, gss_test)
-
-# Random Forest Model
-model_rf <- train(`work hours` ~ ., 
-                  data = gss_train, 
-                  method = "ranger", 
-                  preProcess = "medianImpute", 
-                  na.action = na.pass, 
-                  trControl = myControl)
-rf_predict <- predict(model_rf, gss_test)
-
-# eXtreme Gradient Boosting Model
-model_xgb <- train(`work hours` ~ ., 
-                   data = gss_train, 
-                   method = "xgbLinear", 
-                   preProcess = "medianImpute", 
-                   na.action = na.pass, 
-                   trControl = myControl)
-xgb_predict <- predict(model_xgb, gss_test)
+# 10 folds used in cross-validation from training set
+training_folds = createFolds(gss_tbl_train$`work hours`, 10)
+# reusable trainControl for all models 
+reuseControl = trainControl( method = "cv", number = 10, search = "grid", 
+                             indexOut = training_folds, verboseIter = TRUE)
 
 
+mod_ls = list()
+for(i in 1:length(mod_vec)){
+  method = mod_vec[i]
+  if(method == "lm" | method == "glmnet"){
+    pre_process = c("center", "scale", "nzv", "medianImpute")
+  }else{
+    pre_process = "medianImpute"
+  }
+  mod = train(`work hours` ~ .,
+              data = gss_tbl_train,
+              method = method,
+              metric = "Rsquared",
+              na.action = na.pass,
+              trControl = reuseControl,
+              preProcess = pre_process)
+  mod_ls[[i]] = mod
+}
+
+results = function(train_mod){
+  algo = train_mod$method
+  cv_rsq = str_remove(format(round(max(train_mod$results$Rsquared), 2), nsmall = 2), "^\\d")
+  preds = predict(train_mod, gss_tbl_test, na.action = na.pass)
+  ho_rsq = str_remove(format(round(cor(preds, gss_tbl_test$`work hours`)^2, 2), nsmall = 2), "^\\d")
+  return(c("algo" = algo, "cv_rsq" = cv_rsq, "ho_sq" = ho_rsq))
+}
+
+table1_tbl <- as_tibble(t(sapply(mod_ls, results)))
+
+# The results varied significantly between models, with tree-based methods and regularized regression outperforming the linear model due to their ability to capture complex, non-linear patterns in the data. The linear model's underperformance likely stems from its inability to model these complexities
+# The R-squared values decreased from k-fold CV to holdout CV for all models, indicating a potential overfit to the training data and suggesting that the models may not generalize as well to unseen data. This drop is a common occurrence when models capture noise in the training data that does not represent true underlying patterns
+# For a real-life prediction problem, I would choose the Random Forest model (ranger) due to its balance between high cv_rsq and relatively stable performance on the holdout set, indicating good generalization. While XGBoost showed the highest cv_rsq, its larger drop in performance on the holdout set suggests overfitting. The choice involves tradeoffs between interpretability and predictive accuracy, with Random Forest offering a middle ground 
